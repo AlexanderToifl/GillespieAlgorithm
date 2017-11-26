@@ -5,66 +5,35 @@
 #include <time.h>
 #include <math.h>
 
+#include "utils.h"
+#include "gillespie_kernels.h"
+
 #include <thrust/device_vector.h>
 #include <thrust/generate.h>
 #include <thrust/reduce.h>
+#include <thrust/scan.h>
 #include <thrust/random.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/random/uniform_real_distribution.h>
 
+
 #define DEBUG 0
 #define PRINT_CONFIG 0
 
-#define THREADS_PER_BLOCK 32
-
-#define IDX2C(i,j,ld) (((j)*(ld))+(i)) // column-major format for matrices
-#define C2IDX_1(k,ld) ((k)%(ld)) // index 1
-#define C2IDX_2(k,ld) ((k)/(ld)) // index 2
-
-
-//error handling
-void gpuAssert(cudaError_t code, const char *file, int line, int abort)
-{
-   if (code != cudaSuccess) 
-   {
-      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
-}
-#define CUDA_ERR(ans) gpuAssert((ans), __FILE__, __LINE__, 1)
-
-
-
-void curandAssert(curandStatus_t code, const char *file, int line, int abort)
-{
-   if (code != CURAND_STATUS_SUCCESS) 
-   {
-      fprintf(stderr,"curandAssert in %s %d\n", file, line);
-      if (abort) exit(code);
-   }
-}
-#define CURAND_ERR(ans) curandAssert((ans), __FILE__, __LINE__, 1) 
-
 //gillespie alogrithm for a problem with dim states, exactly n time steps are calculated
-//curand implementation
+//curand implementation, not optimized
 void gillespie_n_curand(double *K, int *X, int dim, long max_steps, int threads_per_block);
 
 //thrust implementation
 void gillespie_n_thrust(double *K, int *X, int dim, long max_steps,  int threads_per_block);
 
-//host helper functions
-void rateMatrix(double *K, int nrows, int ncols, double kup, double kdown); //create banded matrix K
-void printMat(double *A, int nrows, int ncols);
-void printIntMat(int *A, int nrows, int ncols);
+//create banded matrix K
+void rateMatrix(double *K, int nrows, int ncols, double kup, double kdown); 
 
-__global__ void transitionMatrix(double *d_K, int *d_X, double *d_A, int dim);
-
-
-
+//functor for uniform distribution of doubles in [0,1)
 struct uniform_gen
 {
     __host__ __device__  uniform_gen(double _a, double _b) : a(_a), b(_b) {;}
-
     __device__ double operator()(const unsigned int n) const
     {
         thrust::default_random_engine rng;
@@ -73,160 +42,23 @@ struct uniform_gen
         return dist(rng);
     }
     double a, b;
-
 };
 
 
-//not optimized kernels
-__global__ void reaction(double *d_A, int *d_X, double *norm, double *random_number, int dim); //TODO change to parallel algorithm
-__global__ void reduce(double *d_A, double *d_res, int size); //TODO possible to parallize?
-__global__ void exponentialRN(double *d_R, double *d_time, double *a, int pos);
 
+void rateMatrix(double *K, int nrows, int ncols, double kup, double kdown)
+{    
+    for ( int j = 1; j < ncols; ++j)
+        K[IDX2C( j - 1, j, nrows)] = kup;
 
-//TODO sample discrete distribution - parallel algorithm, d_A is assumed to be already normalized
-__global__ void reaction_normalized(double *d_A, int *d_X, double *random_number, int dim);
-
-
-
-//TODO sample discrete distribution - parallel algorithm
-__global__ void reaction(double *d_A, int *d_X, double *norm, double *random_number, int dim)
-{
-    
-    
-    int i = threadIdx.x + blockDim.x * blockIdx.x;
-    
-    double scan_entry = 0;
-    int random_idx = 0;
-    int k = 0, l = 0;
-   
-    scan_entry = d_A[0]/(*norm);
-    
-    if( i < 1)
-    {
-        for(int j = 0; j < dim * dim; ++j)
-        {
-            scan_entry = scan_entry + d_A[j]/(*norm);
-            
-            if( *random_number < scan_entry)
-            {
-               random_idx = j;
-               //k -> l
-               k = C2IDX_1(random_idx,dim);
-               l = C2IDX_2(random_idx,dim);
-               
-               d_X[k] -= 1;
-               d_X[l] += 1;
-               
-               break;
-            }
-            
-        }
-    } 
-    
-    __syncthreads();
-    
-    //printf("k = %d, l = %d X[k] = %d, X[l] = %d\n", k, l, d_X[k], d_X[l]);
-}
-
-//TODO sample discrete distribution - parallel algorithm, d_A is assumed to be already normalized
-__global__ void reaction_normalized(double *d_A, int *d_X, double *random_number, int dim)
-{
-    
-    
-    int i = threadIdx.x + blockDim.x * blockIdx.x;
-    
-    double scan_entry = 0;
-    int random_idx = 0;
-    int k = 0, l = 0;
-   
-    scan_entry = d_A[0];
-    
-    if( i < 1)
-    {
-        for(int j = 0; j < dim * dim; ++j)
-        {
-            scan_entry = scan_entry + d_A[j];
-            
-            if( *random_number < scan_entry)
-            {
-               random_idx = j;
-               //k -> l
-               k = C2IDX_1(random_idx,dim);
-               l = C2IDX_2(random_idx,dim);
-               
-               d_X[k] -= 1;
-               d_X[l] += 1;
-               
-               break;
-            }
-            
-        }
-    } 
-    
-    __syncthreads();
-    
-    //printf("k = %d, l = %d X[k] = %d, X[l] = %d\n", k, l, d_X[k], d_X[l]);
-}
-
-
-
-//TODO change to parallel algorithm
-__global__ void reduce(double *d_A, double *d_res, int size)
-{
-    int i = threadIdx.x + blockDim.x * blockIdx.x;
-    
-    double res = 0;
-    
-    if( i < 1)
-    {
-        for(int j = 0; j < size; ++j)
-        {
-            res += d_A[j];
-        } 
-    
-    }
-    
-    *d_res = res;
-}
-
-__global__ void transitionMatrix(double *d_K, int *d_X, double *d_A, int dim)
-{
-    int j = threadIdx.x + blockDim.x * blockIdx.x;
-    int i = threadIdx.y + blockDim.y * blockIdx.y;
-    
-    
-    if( i < dim && j < dim)
-    {
-        d_A[IDX2C(i,j,dim)] = (double) d_X[i] * d_K[IDX2C(i,j,dim)];
-    }
-
-}
-
-__global__ void exponentialRN(double *d_R, double *d_time, double *a, int pos)
-{
-    int i = threadIdx.x + blockDim.x * blockIdx.x;
-    double old_time = 0;
-    
-    if( i < 1)
-    {
-        if(pos > 0)
-            old_time = d_time[pos - 1];
-        
-        d_time[pos] = 1/ *a * log(1/d_R[pos]) + old_time;
-        
-       // printf("time = %lf\n", d_time[pos]);
-       // printf("old_time = %lf\n", old_time);
-       // printf("d_R[pos] = %lf\n", d_R[pos]);
-    }
-    
-    
-    
-
+    for ( int j = 0; j < ncols - 1; ++j)
+        K[IDX2C( j + 1, j, nrows)] = kdown; 
 }
 
 
 void gillespie_n_curand(double *K, int *X, int dim, long max_steps, int threads_per_block)
 {
+    const long PRINT_STEPS = 10000;
     curandGenerator_t gen;
     srand(time(NULL));
     int _seed = rand();
@@ -241,8 +73,6 @@ void gillespie_n_curand(double *K, int *X, int dim, long max_steps, int threads_
     
     CUDA_ERR(cudaMemcpy(d_K, K, dim * dim * sizeof(double), cudaMemcpyHostToDevice));
     CUDA_ERR(cudaMemcpy(d_X, X, dim * sizeof(int), cudaMemcpyHostToDevice));
-    
-    
     
     //allocate space for transitionMatrix A and sum a
     double *d_A;
@@ -269,8 +99,8 @@ void gillespie_n_curand(double *K, int *X, int dim, long max_steps, int threads_
     dim3 dimGrid(ceil(dim/(float) threads_per_block), ceil(dim/(float) threads_per_block));
     dim3 dimBlocks(threads_per_block, threads_per_block);
     
-    printf("dimGrid = %d x %d\n", dimGrid.x, dimGrid.y);
-    printf("dimBlocks = %d x %d\n", dimBlocks.x, dimBlocks.y);
+    //printf("dimGrid = %d x %d\n", dimGrid.x, dimGrid.y);
+    //printf("dimBlocks = %d x %d\n", dimBlocks.x, dimBlocks.y);
     
     long i = 0; //step index
     
@@ -286,11 +116,10 @@ void gillespie_n_curand(double *K, int *X, int dim, long max_steps, int threads_
         exponentialRN<<<1,1>>>(d_r1, d_time, d_a, i);
 
         //which reaction?
-        //search highest entry, such that d_r2 < entry  possible to parallize?
+        //search highest entry, such that d_r2 < entry
         reaction<<<1,1>>>(d_A, d_X, d_a, &d_r2[i], dim);
-
         //print temporary steps
-        if( (i % 1000) == 0)
+        if( (i % PRINT_STEPS) == 0)
         {
             CUDA_ERR(cudaMemcpy(h_tmp_X, d_X, dim * sizeof(int), cudaMemcpyDeviceToHost));
             CUDA_ERR(cudaMemcpy(h_tmp_time, &d_time[i], 1 * sizeof(double), cudaMemcpyDeviceToHost));
@@ -302,11 +131,9 @@ void gillespie_n_curand(double *K, int *X, int dim, long max_steps, int threads_
                 
             printf("]\n");
         }
-        
      }
      
     long time_length = max_steps;
-    
     
     double *h_time = (double*) malloc( time_length * sizeof(double));
      
@@ -335,7 +162,7 @@ void gillespie_n_curand(double *K, int *X, int dim, long max_steps, int threads_
 
 void gillespie_n_thrust(double *K, int *X, int dim, long max_steps, int threads_per_block)
 {
-    //double *d_K;
+    const long PRINT_STEPS = 10000;
     thrust::device_vector<double> d_K(K, &K[dim * dim]);
     thrust::device_vector<int> d_X(X, &X[dim]);
     thrust::device_vector<double> d_A(dim*dim);
@@ -346,6 +173,8 @@ void gillespie_n_thrust(double *K, int *X, int dim, long max_steps, int threads_
     
     dim3 dimGrid(ceil(dim/(float) threads_per_block), ceil(dim/(float) threads_per_block));
     dim3 dimBlocks(threads_per_block, threads_per_block);
+    
+    dim3 nThreads(256);
     
     thrust::device_vector<double> d_r1(n);
     thrust::device_vector<double> d_r2(n);
@@ -362,31 +191,23 @@ void gillespie_n_thrust(double *K, int *X, int dim, long max_steps, int threads_
     {
         transitionMatrix<<< dimGrid, dimBlocks>>>(thrust::raw_pointer_cast(&d_K[0]), thrust::raw_pointer_cast(&d_X[0]), thrust::raw_pointer_cast(&d_A[0]), dim);
          
-         
         a  = thrust::reduce(thrust::device, d_A.begin(),d_A.end());
         
-        dt = 1 / a * log(1/d_r1[i]);
+        dt = 1 / a * log(1/d_r1[i]); //calculation is executed on the CPU
         time += dt;
 
-        //normalize A
+        //normalize A -> A/a
         thrust::transform(d_A.begin(),d_A.end(),thrust::make_constant_iterator(1/a),
                   d_A.begin(),
                   thrust::multiplies<double>()); 
          
-        /*std::cout << "A = [ ";
-        thrust::copy(d_A.begin(), d_A.end(), std::ostream_iterator<double>(std::cout, " "));
-        std::cout << " ]\n";
-         */
+        //scan A/a
+        thrust::inclusive_scan(thrust::device, d_A.begin(),d_A.end(), d_A.begin());
         
-        //sample discrete distribution given by normalized A
-        //and change d_X accordingly
-        //purely sequential algorithm O(n)
-       
+        reaction_scanned<<<1, nThreads>>>(thrust::raw_pointer_cast(&d_A[0]), thrust::raw_pointer_cast(&d_X[0]), thrust::raw_pointer_cast(&d_r2[i]), dim);
         
-        reaction_normalized<<<1,1>>>(thrust::raw_pointer_cast(&d_A[0]), thrust::raw_pointer_cast(&d_X[0]), thrust::raw_pointer_cast(&d_r2[i]), dim);
-        
-
-        if( i % 1000 == 0)
+        //print time and X periodically
+        if( i % PRINT_STEPS == 0)
         {
             std::cout << "time = " << time << ", step = " << i << ", X = [ ";
             thrust::copy(d_X.begin(), d_X.end(), std::ostream_iterator<double>(std::cout, " "));
@@ -399,17 +220,10 @@ void gillespie_n_thrust(double *K, int *X, int dim, long max_steps, int threads_
     thrust::copy(d_X.begin(), d_X.end(), std::ostream_iterator<double>(std::cout, " "));
     std::cout << " ]\n";
     
-   
-    //printMat(thrust::raw_pointer_cast(&d_A[0]), dim, dim);
-
 }
 
 int main ( void ){
-    
-    
-   
-    
-    long n =  50000;
+    long n =  100000;
     int dim = 100; 
     
     
@@ -426,13 +240,10 @@ int main ( void ){
 #if PRINT_CONFIG      
     printIntMat(X, 1, dim);
 #endif    
-   //gillespie_n_curand(K, X, dim, n, THREADS_PER_BLOCK);
-    
+    gillespie_n_curand(K, X, dim, n, THREADS_PER_BLOCK);
     gillespie_n_thrust(K, X, dim, n,THREADS_PER_BLOCK);
     
-   
-    
-    
+
 #if DEBUG    
     double *hostData = (double*) malloc( n * sizeof(double) );
     CUDA_ERR(cudaMemcpy(hostData, d_r2, n * sizeof(double), cudaMemcpyDeviceToHost));
@@ -454,8 +265,6 @@ int main ( void ){
     printMat(A, dim, dim);
     
     free(A);
-    
-    
 #endif    
     
  
@@ -465,52 +274,5 @@ int main ( void ){
     return EXIT_SUCCESS ;
 }
 
-
-void rateMatrix(double *K, int nrows, int ncols, double kup, double kdown)
-{    
-   
-    for ( int j = 1; j < ncols; ++j)
-    {
-        K[IDX2C( j - 1, j, nrows)] = kup;
-    }
-
-    for ( int j = 0; j < ncols - 1; ++j)
-    {
-        K[IDX2C( j + 1, j, nrows)] = kdown; 
-    }
-
-}
-
-void printMat(double *A, int nrows, int ncols)
-{
-    printf("[\t");
-    for(int iy = 0; iy < nrows; ++iy)
-    {
-        for(int ix = 0; ix < ncols; ++ix)
-        {
-           printf("%.2f ", A[iy + ix * nrows]);
-          
-        }
-        printf("\n\t");
-    }
-    
-    printf("\n]\n");
-}    
-
-void printIntMat(int *A, int nrows, int ncols)
-{
-    printf("[\t");
-    for(int iy = 0; iy < nrows; ++iy)
-    {
-        for(int ix = 0; ix < ncols; ++ix)
-        {
-           printf("%d ", A[iy + ix * nrows]);
-          
-        }
-        printf("\n\t");
-    }
-    
-    printf("\n]\n");
-} 
 
 
